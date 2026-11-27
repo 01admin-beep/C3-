@@ -29,3 +29,14 @@ CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1536
 
 # LVGL Graphics
 CONFIG_LV_USE_SNAPSHOT=y
+
+# ── 板型与屏幕 ──
+# 目标板：面包板 WiFi 小板（bread-compact-wifi，S3 N16R8 16MB Flash）
+# OLED：SSD1306 128x64 I2C（默认是 128x32，必须显式覆盖）
+CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI=y
+CONFIG_OLED_SSD1306_128X64=y
+
+# ── 分区表 ──
+# 与设备现有 16MB 布局完全一致（assets 6M@0x800000 + storage 2M@0xE00000），
+# 升级时只刷应用分区即可保留 NVS(WiFi 配置)/assets/storage 数据
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m_compat.csv"
