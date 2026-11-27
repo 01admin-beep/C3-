@@ -40,19 +40,14 @@ private:
 
     void InitializeDisplayI2c() {
         // ── 自动探测 OLED 的 I2C 引脚与地址 ──
-        // 不同小智开发板的 OLED 引脚定义不同（41/42、4/15、7/8、15/16、12/13 等），
-        // 逐组创建 I2C 总线并 probe 常见地址 0x3C/0x3D，命中即用，避免刷错板型黑屏。
-        static const int kPinCandidates[][2] = {
-            {DISPLAY_SDA_PIN, DISPLAY_SCL_PIN},  // config.h 默认配置优先
-            {41, 42}, {4, 15}, {7, 8}, {15, 16}, {12, 13},
-            {13, 12}, {16, 15}, {8, 9}, {6, 7},
-        };
+        //   1) NVS 里上次扫到的引脚（秒连）
+        //   2) config.h 默认 + 常见板型组合
+        //   3) 全 GPIO 组合扫描（约 20 秒，扫到后写入 NVS，下次不再慢扫）
         static const uint8_t kAddrs[] = {0x3C, 0x3D};
+        Settings display_settings("display");
 
-        for (const auto& pins : kPinCandidates) {
-            int sda = pins[0], scl = pins[1];
-            if (sda < 0 || scl < 0) continue;      // GPIO_NUM_NC 跳过
-            if (sda == scl) continue;
+        auto try_pair = [this](int sda, int scl) -> int {
+            if (sda < 0 || scl < 0 || sda == scl) return -1;
             i2c_master_bus_config_t bus_config = {
                 .i2c_port = (i2c_port_t)0,
                 .sda_io_num = (gpio_num_t)sda,
@@ -66,22 +61,71 @@ private:
                 },
             };
             i2c_master_bus_handle_t bus = nullptr;
-            if (i2c_new_master_bus(&bus_config, &bus) != ESP_OK) continue;
-
-            bool found = false;
+            if (i2c_new_master_bus(&bus_config, &bus) != ESP_OK) return -1;
+            int found = -1;
             for (uint8_t addr : kAddrs) {
-                if (i2c_master_probe(bus, addr, 50) == ESP_OK) {
-                    display_i2c_bus_ = bus;
-                    display_addr_ = addr;
-                    found = true;
-                    ESP_LOGI(TAG, "OLED found: SDA=%d SCL=%d addr=0x%02X", sda, scl, addr);
-                    break;
+                if (i2c_master_probe(bus, addr, 20) == ESP_OK) { found = addr; break; }
+            }
+            if (found < 0) {
+                i2c_del_master_bus(bus);
+                return -1;
+            }
+            display_i2c_bus_ = bus;
+            return found;
+        };
+
+        auto save_pins = [](int sda, int scl) {
+            Settings("display", true).SetInt("i2c_pins", (sda << 8) | scl);
+        };
+
+        // 1) NVS 缓存
+        int saved = display_settings.GetInt("i2c_pins", -1);
+        if (saved > 0) {
+            int addr = try_pair(saved >> 8, saved & 0xFF);
+            if (addr >= 0) {
+                display_addr_ = (uint8_t)addr;
+                ESP_LOGI(TAG, "OLED found (NVS): SDA=%d SCL=%d addr=0x%02X", saved >> 8, saved & 0xFF, addr);
+                return;
+            }
+        }
+
+        // 2) 常见组合（config.h 默认 + 各类小智板常见接法）
+        static const int kCommon[][2] = {
+            {DISPLAY_SDA_PIN, DISPLAY_SCL_PIN},
+            {41, 42}, {4, 15}, {7, 8}, {15, 16}, {12, 13},
+            {13, 12}, {16, 15}, {8, 9}, {6, 7}, {5, 6}, {4, 5},
+            {1, 2}, {9, 10}, {10, 11}, {11, 12}, {14, 21}, {38, 39},
+        };
+        for (const auto& pins : kCommon) {
+            int addr = try_pair(pins[0], pins[1]);
+            if (addr >= 0) {
+                display_addr_ = (uint8_t)addr;
+                save_pins(pins[0], pins[1]);
+                ESP_LOGI(TAG, "OLED found: SDA=%d SCL=%d addr=0x%02X", pins[0], pins[1], addr);
+                return;
+            }
+        }
+
+        // 3) 全引脚组合扫描（排除 flash/PSRAM/UART/strapping 及按键等固定占用脚）
+        static const int kScanPins[] = {
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+            19, 20, 21, 38, 39, 40, 41, 42, 47, 48,
+        };
+        const int n = sizeof(kScanPins) / sizeof(kScanPins[0]);
+        ESP_LOGI(TAG, "Full I2C pin scan started (%d pairs)...", n * (n - 1));
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                if (i == j) continue;
+                int addr = try_pair(kScanPins[i], kScanPins[j]);
+                if (addr >= 0) {
+                    display_addr_ = (uint8_t)addr;
+                    save_pins(kScanPins[i], kScanPins[j]);
+                    ESP_LOGI(TAG, "OLED found (scan): SDA=%d SCL=%d addr=0x%02X", kScanPins[i], kScanPins[j], addr);
+                    return;
                 }
             }
-            if (found) return;
-            i2c_del_master_bus(bus);
         }
-        ESP_LOGE(TAG, "OLED not found on any known I2C pins, display disabled");
+        ESP_LOGE(TAG, "OLED not found on any GPIO pair, display disabled");
     }
 
     void InitializeSsd1306Display() {
