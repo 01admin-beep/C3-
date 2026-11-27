@@ -73,6 +73,7 @@ private:
     //   2 = 星空      3 = 星际穿越    4 = 指针时钟    5 = 数字雨
     //   6 = 等离子    7 = 隧道        8 = 波浪        9 = 弹球
     //  10 = 生命游戏 11 = 立方体
+    //  12 = 烟花      13 = 心跳       14 = 星云
     //  编号以 kWallpaperCount 为界，新增效果只需：加一个 Render*()、在
     //  RenderTick 里加分支、把名字补进 kWallpaperNames、并把计数 +1。
     std::atomic<int> wallpaper_{0};
@@ -113,6 +114,25 @@ private:
 
     // 立方体壁纸（11）：绕 X / Y 轴的两个旋转角
     float cube_ax_ = 0.6f, cube_ay_ = 0.35f;
+
+    // ── 烟花壁纸（12）：3 组礼花"升空 → 爆炸 → 熄灭"循环 ──
+    struct FwParticle { float x, y, vx, vy; int life; };
+    struct FwShell   { float x, y, vx, vy; int fuse; bool exploded; };
+    static constexpr int kFwShells = 3;
+    static constexpr int kFwParticles = 26;   // 每朵爆炸的火花数
+    FwShell   fw_shells_[kFwShells] = {};
+    FwParticle fw_particles_[kFwShells][kFwParticles] = {};
+    bool fw_ready_ = false;                   // 首帧播种
+
+    // ── 心跳壁纸（13）：搏动的心 + 底部心电波形 ──
+    float heart_phase_ = 0.0f;                // 一个心跳周期 0..2π
+
+    // ── 星云壁纸（14）：双旋臂星系缓慢旋转 + 星星闪烁 ──
+    static constexpr int kGalaxyStars = 110;
+    float galaxy_ang_[kGalaxyStars] = {0};    // 每颗星在旋臂上的初始角
+    float galaxy_rad_[kGalaxyStars] = {0};    // 每颗星到星系中心的距离
+    bool  galaxy_ready_ = false;              // 首帧播种
+    float galaxy_rot_ = 0.0f;                 // 星系整体旋转角
 
     char status_text_[32] = {0};              // 状态文字（表情下方一行）
     char song_name_[32] = {0};                // 歌名（音乐界面顶部显示）
@@ -189,6 +209,9 @@ private:
     void RenderBounce();     // 壁纸9: 弹球（物理反弹 + 拖尾）
     void RenderLife();       // 壁纸10: 康威生命游戏（2x2 像素一个细胞）
     void RenderCube();       // 壁纸11: 3D 线框立方体（双轴旋转 + 透视）
+    void RenderFireworks();  // 壁纸12: 烟花（升空 → 爆炸 → 熄灭循环）
+    void RenderHeartbeat();  // 壁纸13: 跳动的心（双搏动节奏 + 心电波形）
+    void RenderGalaxy();     // 壁纸14: 星云（双旋臂星系差速旋转）
     void SeedLife();         // 生命游戏：随机播种
     void StepLife();         // 生命游戏：演化一代（双缓冲）
     void RenderChatText();   // 文字模式: 内容区显示助手回复（自动换行）
@@ -252,7 +275,7 @@ public:
     void SetBatteryPercent(int pct) { battery_pct_ = pct; dirty_ = true; }
 
     // 壁纸总数（新增效果时只改这一个常量；网页 / 长按循环 / 名称表都以它为准）
-    static constexpr int kWallpaperCount = 12;
+    static constexpr int kWallpaperCount = 15;
 
     // 壁纸中文名（越界返回 "?"，绝不返回野指针 —— 历史上 %s 解引用越界
     // 数组直接把设备打崩过）
