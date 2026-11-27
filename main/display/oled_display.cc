@@ -12,6 +12,7 @@
 #include <ctime>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <algorithm>
 #include "board.h"
@@ -23,6 +24,10 @@
 #include "font/lv_font_fmt_txt.h"   // 直接读字库数据表（不用 lvgl 运行时）
 
 #define TAG "OledDisplay"
+
+// 2π（RenderPlanet 内部另有一份局部定义，这里提供文件级常量供新增壁纸使用）
+static constexpr float kPi  = 3.1415927f;
+static constexpr float kPi2 = 6.2831853f;
 
 // 6x8 ASCII 字体（0x20~0x7E 完整可打印字符）
 // 每个字符 6 字节，bit 1=亮
@@ -508,6 +513,27 @@ void OledDisplay::RenderTick() {
             last_planet_us_ = now;
             RenderCube();
         }
+    } else if (wallpaper_.load() == 12) {
+        // ── 壁纸 12 = 烟花：~16fps（火花下坠要连贯）──
+        const int64_t now = esp_timer_get_time();
+        if (now - last_planet_us_ >= 60000) {
+            last_planet_us_ = now;
+            RenderFireworks();
+        }
+    } else if (wallpaper_.load() == 13) {
+        // ── 壁纸 13 = 心跳：20fps（搏动节奏要顺滑）──
+        const int64_t now = esp_timer_get_time();
+        if (now - last_planet_us_ >= 50000) {
+            last_planet_us_ = now;
+            RenderHeartbeat();
+        }
+    } else if (wallpaper_.load() == 14) {
+        // ── 壁纸 14 = 星云：12fps（星系旋转缓慢，足够连贯）──
+        const int64_t now = esp_timer_get_time();
+        if (now - last_planet_us_ >= 80000) {
+            last_planet_us_ = now;
+            RenderGalaxy();
+        }
     } else {
         // ── 待机主题 = 静态时钟：**每秒**重绘一次 ──
         //   秒级刷新是为了让冒号闪动（原来 1 次/分钟时屏幕完全是死的）。
@@ -889,7 +915,8 @@ void OledDisplay::RenderPlanet() {
 //   WallpaperName() 会返回 "?"（不会崩，但日志/网页上显示不出来）。
 static const char* const kWallpaperNames[] = {
     "时钟", "星球", "星空", "星际穿越", "指针时钟", "数字雨",
-    "等离子", "隧道", "波浪", "弹球", "生命游戏", "立方体"
+    "等离子", "隧道", "波浪", "弹球", "生命游戏", "立方体",
+    "烟花", "心跳", "星云"
 };
 
 const char* OledDisplay::WallpaperName(int wp) {
@@ -916,6 +943,181 @@ int OledDisplay::NextWallpaper() {
     SetWallpaper(next);
     return next;
 }
+
+// ── 壁纸 12：烟花 ──
+//   内容区 y∈[kStatusBarH, 63]。三组礼花各自独立走"升空 → 爆炸 → 熄灭"
+//   三个阶段，相位错开：升空时一颗亮点拖着随机抖动的尾迹，到顶后炸成
+//   kFwParticles 颗火花（随机初速 + 重力下坠 + 寿命衰减），烧完后重新升空。
+//   计算量：每帧 ≤ 3 壳 + 78 粒子 = 81 次简单浮点运算，单核无压力。
+void OledDisplay::RenderFireworks() {
+    const int top = kStatusBarH;
+    const int bottom = kHeight - 1;      // 63
+    if (!fw_ready_) {
+        for (int s = 0; s < kFwShells; s++) {
+            fw_shells_[s].x = 20 + rand() % 88;
+            fw_shells_[s].y = bottom;
+            fw_shells_[s].vx = (rand() % 9 - 4) * 0.08f;
+            fw_shells_[s].vy = -(1.6f + (rand() % 8) * 0.12f);
+            fw_shells_[s].fuse = 46 + rand() % 30;   // 相位错开
+            fw_shells_[s].exploded = false;
+        }
+        fw_ready_ = true;
+    }
+    Clear();
+    DrawStatusBar();
+    for (int s = 0; s < kFwShells; s++) {
+        FwShell& sh = fw_shells_[s];
+        if (!sh.exploded) {
+            // 升空：亮点 + 抖动尾迹
+            const int ix = (int)sh.x, iy = (int)sh.y;
+            if (iy > top) {
+                SetPixel(ix, iy, true);
+                SetPixel(ix + (rand() % 3 - 1), iy + 2, true);
+                SetPixel(ix + (rand() % 3 - 1), iy + 4, true);
+            }
+            sh.x += sh.vx;
+            sh.y += sh.vy;
+            sh.vy += 0.03f;                  // 轻微重力减速
+            if (--sh.fuse <= 0 || sh.vy >= -0.2f) {
+                // 爆炸：径向均匀撒火花，速度随距离衰减（球面感）
+                sh.exploded = true;
+                const float cx = sh.x, cy = sh.y;
+                for (int p = 0; p < kFwParticles; p++) {
+                    const float a = kPi2 * p / kFwParticles + (rand() % 16) * 0.01f;
+                    const float sp = 0.9f + (rand() % 9) * 0.11f;
+                    FwParticle& pt = fw_particles_[s][p];
+                    pt.x = cx; pt.y = cy;
+                    pt.vx = cosf(a) * sp;
+                    pt.vy = sinf(a) * sp;
+                    pt.life = 22 + rand() % 12;
+                }
+            }
+        } else {
+            // 爆炸后：火花飘散 + 重力 + 闪烁熄灭
+            int alive = 0;
+            for (int p = 0; p < kFwParticles; p++) {
+                FwParticle& pt = fw_particles_[s][p];
+                if (pt.life <= 0) continue;
+                pt.life--;
+                pt.x += pt.vx;
+                pt.y += pt.vy;
+                pt.vy += 0.06f;              // 火花下坠
+                pt.vx *= 0.985f;
+                if (pt.life > 0) {
+                    alive++;
+                    // 寿命末期闪烁（隔帧点亮）模拟余烬
+                    if (pt.life > 6 || (pt.life & 1)) {
+                        const int px = (int)pt.x, py = (int)pt.y;
+                        if (px >= 0 && px < kWidth && py >= top && py <= bottom)
+                            SetPixel(px, py, true);
+                    }
+                }
+            }
+            if (alive == 0) {
+                // 这一组烧完 → 重新升空（随机落点）
+                sh.x = 20 + rand() % 88;
+                sh.y = bottom;
+                sh.vx = (rand() % 9 - 4) * 0.08f;
+                sh.vy = -(1.6f + (rand() % 8) * 0.12f);
+                sh.fuse = 30 + rand() % 40;
+                sh.exploded = false;
+            }
+        }
+    }
+    PushFrame();
+}
+
+// ── 壁纸 13：心跳 ──
+//   上半部：按"咚-咚 —— 咚-咚"双搏动节奏缩放的心形（两圆 + 三角拼出，
+//   避免逐像素曲线求交）；下半部：一条滚动的 ECG 心电波形（QRS 尖峰 +
+//   T 波圆顶），与心跳共用同一相位 —— 心缩一下，波形跳一下，浑然一体。
+void OledDisplay::RenderHeartbeat() {
+    Clear();
+    DrawStatusBar();
+    const float cx = 64.0f, cy = kStatusBarH + 17.0f;   // 心形中心 (64, 33)
+    // 双搏动：主搏 + 次搏，一个周期 ~1.1s（phase 步进 20fps × 0.095 ≈ 1.9 rad/s）
+    float beat = 0.0f;
+    const float d1 = fmodf(heart_phase_, kPi2);
+    const float d2 = fmodf(heart_phase_ - 1.4f, kPi2);
+    for (int k = 0; k < 2; k++) {
+        const float d = (k == 0) ? d1 : d2;
+        if (d >= 0.0f && d < 1.1f) {
+            const float g = expf(-d * d * 7.5f);
+            beat += (k == 0) ? g : g * 0.55f;
+        }
+    }
+    const float r = 8.5f + 4.5f * beat;               // 半径 8.5..13
+    // 两个上圆 + 底部三角拼出心形
+    DrawEllipseFill((int)(cx - r * 0.55f), (int)(cy - r * 0.35f), (int)r, (int)r);
+    DrawEllipseFill((int)(cx + r * 0.55f), (int)(cy - r * 0.35f), (int)r, (int)r);
+    DrawTriangleFill((int)(cx - r * 0.98f), (int)(cy - r * 0.1f),
+                     (int)(cx + r * 0.98f), (int)(cy - r * 0.1f),
+                     (int)cx, (int)(cy + r * 1.45f));
+    // 底部 ECG 波形：基线 y=60，QRS 尖峰 + T 波
+    const int base_y = 60;
+    int prev_y = -1;
+    for (int x = 0; x < kWidth; x++) {
+        const float t = heart_phase_ - x * 0.055f;    // 波形随相位向左滚动
+        float v = 0;
+        const float q = fmodf(t, kPi2);
+        if (q >= 0 && q < 0.18f)       v = -2.0f * sinf(q / 0.18f * kPi);   // Q 波(向下)
+        else if (q >= 0.22f && q < 0.40f) {                                     // R 尖峰(向上)
+            const float u = (q - 0.22f) / 0.18f;
+            v = -2.0f + 14.0f * sinf(u * kPi);
+        }
+        else if (q >= 0.45f && q < 0.85f)  v = 3.5f * sinf((q - 0.45f) / 0.4f * kPi);  // T 波(圆顶)
+        const int y = base_y - (int)v;
+        if (prev_y >= 0) {
+            // 相邻列连线，尖峰才不会断成虚线
+            DrawLine(x - 1, prev_y, x, y, true);
+        } else {
+            SetPixel(x, y, true);
+        }
+        prev_y = y;
+    }
+    heart_phase_ += 0.095f;
+    if (heart_phase_ > 1000.0f * kPi2) heart_phase_ = fmodf(heart_phase_, kPi2);
+    PushFrame();
+}
+
+// ── 壁纸 14：星云 ──
+//   110 颗星分布在两条对数螺旋旋臂上，整体绕中心旋转，且**外圈转得慢、
+//   内圈转得快**（真实星系的差速自转）；核心是几颗高亮像素 + 仰角压扁
+//   （y × 0.55）营造盘面倾视感。星星用哈希取模做伪随机闪烁。
+void OledDisplay::RenderGalaxy() {
+    if (!galaxy_ready_) {
+        for (int i = 0; i < kGalaxyStars; i++) {
+            const float t = (float)i / kGalaxyStars;
+            const int arm = i & 1;                        // 两条旋臂
+            // 对数螺旋：半径从 4 涨到 55，角度随半径卷绕
+            galaxy_rad_[i] = 4.0f + 51.0f * t * t * (0.7f + 0.3f * ((i * 37) % 16) / 16.0f);
+            galaxy_ang_[i] = arm * kPi + galaxy_rad_[i] * 0.115f
+                           + ((i * 53) % 23 - 11) * 0.045f;   // 沿旋臂散布
+        }
+        galaxy_ready_ = true;
+    }
+    Clear();
+    DrawStatusBar();
+    const float cx = 64.0f, cy = kStatusBarH + 24.0f;   // (64, 40)
+    galaxy_rot_ += 0.016f;
+    for (int i = 0; i < kGalaxyStars; i++) {
+        // 差速旋转：内快外慢
+        const float ang = galaxy_ang_[i] + galaxy_rot_ * (1.6f - galaxy_rad_[i] / 60.0f);
+        const float x = cx + cosf(ang) * galaxy_rad_[i] * 1.15f;
+        const float y = cy + sinf(ang) * galaxy_rad_[i] * 0.55f;
+        const int px = (int)x, py = (int)y;
+        if (px < 0 || px >= kWidth || py < kStatusBarH || py >= kHeight) continue;
+        // 伪随机闪烁：约 1/6 的星每隔几帧才亮
+        if (((i * 13 + (int)(galaxy_rot_ * 60.0f)) % 7) == 0) continue;
+        SetPixel(px, py, true);
+    }
+    // 星系核心：3x3 高亮块 + 四点十字
+    DrawFillRect(63, 39, 2, 2, true);
+    SetPixel(64, 37, true); SetPixel(64, 43, true);
+    SetPixel(61, 40, true); SetPixel(67, 40, true);
+    PushFrame();
+}
+
 
 // ── 壁纸 3：星际穿越 ──
 //   3D 星场：星点从画面中心向外辐射飞出，越近越大（透视）。
